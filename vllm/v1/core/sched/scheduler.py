@@ -1593,10 +1593,30 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
+            # Check if reasoning ends in this step BEFORE validating/speculative decoding
+            reasoning_ended_before_update = (
+                request.structured_output_request.reasoning_ended
+                if request.structured_output_request
+                else False
+            )
+            should_advance = self.structured_output_manager.should_advance(request)
+            reasoning_ended_after_update = (
+                request.structured_output_request.reasoning_ended
+                if request.structured_output_request
+                else False
+            )
+
+            # If reasoning transitioned from not-ended to ended in this step,
+            # discard speculative tokens generated during reasoning phase
+            if reasoning_ended_before_update is False and reasoning_ended_after_update:
+                spec_token_ids = []
+            elif should_advance:
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            else:
+                # Still in reasoning phase, don't validate against grammar
+                pass
+
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
