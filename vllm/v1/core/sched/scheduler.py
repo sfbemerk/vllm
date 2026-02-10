@@ -1347,10 +1347,10 @@ class Scheduler(SchedulerInterface):
                 structured_req = request.structured_output_request
                 if structured_req is not None and not structured_req.reasoning_ended:
                     reasoner = self.structured_output_manager.reasoner
-                    full_ids = list(request.all_token_ids) + list(new_token_ids)
-                    delta_ids = list(new_token_ids)
-                    if reasoner.is_reasoning_end_streaming(full_ids, delta_ids):
-                        content_ids = reasoner.extract_content_ids(delta_ids)
+                    if reasoner.is_reasoning_end_streaming(
+                        request.all_token_ids, new_token_ids
+                    ):
+                        content_ids = reasoner.extract_content_ids(new_token_ids)
                         if (
                             content_ids
                             and len(content_ids) <= len(new_token_ids)
@@ -1412,7 +1412,8 @@ class Scheduler(SchedulerInterface):
                 and reasoner is not None
                 and not self.structured_output_manager.enable_in_reasoning
             ):
-                full_ids_with_new = list(request.all_token_ids)
+                # Avoid creating a new list - use the ConstantList directly
+                full_ids_with_new = request.all_token_ids
                 # If the current all_token_ids ends with reasoning end, this is the step it ended
                 if reasoner.is_reasoning_end(full_ids_with_new) and len(
                     full_ids_with_new
@@ -1655,15 +1656,17 @@ class Scheduler(SchedulerInterface):
                 and request.use_structured_output
                 and reasoner is not None
             ):
-                should_validate = reasoner.is_reasoning_end(list(request.all_token_ids))
+                # Avoid creating a new list - use the ConstantList directly
+                should_validate = reasoner.is_reasoning_end(request.all_token_ids)
 
                 # Disable spec decode during reasoning transition to avoid grammar violations.
                 # When reasoning end is detected within spec tokens, clear them to force
                 # non-speculative generation, allowing grammar to activate cleanly.
                 if not should_validate:
                     for i, token_id in enumerate(spec_token_ids):
-                        test_seq = list(request.all_token_ids) + spec_token_ids[: i + 1]
-                        if reasoner.is_reasoning_end(test_seq):
+                        if reasoner.is_reasoning_end_streaming(
+                            request.all_token_ids, spec_token_ids[: i + 1]
+                        ):
                             spec_token_ids = []
                             break
 
@@ -1702,9 +1705,8 @@ class Scheduler(SchedulerInterface):
                 # Check if reasoning has already ended even if should_advance returns False
                 reasoner = self.structured_output_manager.reasoner
                 if reasoner is not None:
-                    should_validate = reasoner.is_reasoning_end(
-                        list(request.all_token_ids)
-                    )
+                    # Avoid creating a new list - use the ConstantList directly
+                    should_validate = reasoner.is_reasoning_end(request.all_token_ids)
 
             if should_validate:
                 metadata = request.structured_output_request
