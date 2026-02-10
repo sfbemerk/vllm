@@ -358,7 +358,6 @@ class StructuredOutputManager:
 
             # Check if reasoning has actually ended by looking at tokens
             # This handles async scheduling where flags might be stale
-            # Avoid creating a new list - use the ConstantList directly
             if self.reasoner.is_reasoning_end(request.all_token_ids):
                 # Also update the flag for consistency
                 request.structured_output_request.reasoning_ended = True
@@ -388,7 +387,6 @@ class StructuredOutputManager:
         if structured_req.reasoning_ended:
             # Guard against speculative draft tokens that suggested reasoning
             # ended but were not actually accepted in the output.
-            # Avoid creating a new list - use the ConstantList directly
             is_reasoning_end_check = self.reasoner.is_reasoning_end(
                 request.all_token_ids
             )
@@ -399,7 +397,6 @@ class StructuredOutputManager:
 
         # Check if reasoning ends in *this* step
         delta_from = request.num_computed_tokens - request.num_output_placeholders
-        # Slicing a ConstantList returns a list, which is acceptable for delta_ids
         delta_ids = request.all_token_ids[delta_from:]
         if self.reasoner.is_reasoning_end_streaming(request.all_token_ids, delta_ids):
             structured_req.reasoning_ended = True

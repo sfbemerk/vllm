@@ -1412,13 +1412,12 @@ class Scheduler(SchedulerInterface):
                 and reasoner is not None
                 and not self.structured_output_manager.enable_in_reasoning
             ):
-                # Avoid creating a new list - use the ConstantList directly
-                full_ids_with_new = request.all_token_ids
                 # If the current all_token_ids ends with reasoning end, this is the step it ended
-                if reasoner.is_reasoning_end(full_ids_with_new) and len(
-                    full_ids_with_new
-                ) > len(new_token_ids):
-                    prev_ids = full_ids_with_new[: -len(new_token_ids)]
+                if (
+                    reasoner.is_reasoning_end(request.all_token_ids)
+                    and len(request.all_token_ids) > len(new_token_ids)
+                ):
+                    prev_ids = request.all_token_ids[: -len(new_token_ids)]
                     if not reasoner.is_reasoning_end(prev_ids):
                         # Reasoning ended in THIS step, don't advance grammar with these tokens
                         should_advance_grammar = False
@@ -1656,7 +1655,6 @@ class Scheduler(SchedulerInterface):
                 and request.use_structured_output
                 and reasoner is not None
             ):
-                # Avoid creating a new list - use the ConstantList directly
                 should_validate = reasoner.is_reasoning_end(request.all_token_ids)
 
                 # Disable spec decode during reasoning transition to avoid grammar violations.
@@ -1705,7 +1703,6 @@ class Scheduler(SchedulerInterface):
                 # Check if reasoning has already ended even if should_advance returns False
                 reasoner = self.structured_output_manager.reasoner
                 if reasoner is not None:
-                    # Avoid creating a new list - use the ConstantList directly
                     should_validate = reasoner.is_reasoning_end(request.all_token_ids)
 
             if should_validate:
