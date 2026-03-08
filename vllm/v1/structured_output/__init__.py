@@ -17,6 +17,7 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
+import numpy as np
 
 if TYPE_CHECKING:
     import numpy as np
