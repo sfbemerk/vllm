@@ -1416,6 +1416,8 @@ class Scheduler(SchedulerInterface):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
+                grammar = struct_output_request.grammar
+                state_before = getattr(grammar, "num_processed_tokens", "?")
                 # When reasoning ends within this token batch (e.g. during
                 # speculative decoding), only the tokens after the
                 # reasoning_end marker should be fed to the grammar.
@@ -1424,15 +1426,32 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
+                logger.info(
+                    "[GRDBG] update_from_output: req=%s, "
+                    "new_token_ids=%s, tokens_for_grammar=%s, "
+                    "grammar_state_before=%s, reasoning_ended=%s",
+                    req_id,
+                    new_token_ids,
+                    tokens_for_grammar,
+                    state_before,
+                    struct_output_request.reasoning_ended,
+                )
                 if tokens_for_grammar:
-                    ok = struct_output_request.grammar.accept_tokens(
-                        req_id, tokens_for_grammar
-                    )
+                    ok = grammar.accept_tokens(req_id, tokens_for_grammar)
                     if not ok:
-                        logger.warning(
-                            "Unexpected: grammar rejected tokens %s for request %s.",
-                            tokens_for_grammar,
+                        state_after = getattr(grammar, "num_processed_tokens", "?")
+                        logger.error(
+                            "[GRDBG] update_from_output: req=%s "
+                            "GRAMMAR REJECTED tokens! "
+                            "grammar_state=%s->%s "
+                            "(PARTIAL ADVANCE, NO ROLLBACK), "
+                            "tokens_for_grammar=%s, "
+                            "all new_token_ids=%s",
                             req_id,
+                            state_before,
+                            state_after,
+                            tokens_for_grammar,
+                            new_token_ids,
                         )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
@@ -1750,6 +1769,7 @@ class Scheduler(SchedulerInterface):
         metadata = request.structured_output_request
         assert metadata is not None and metadata.grammar is not None
 
+        grammar_state = getattr(metadata.grammar, "num_processed_tokens", "?")
         split_idx = self.structured_output_manager.find_reasoning_end_in_tokens(
             spec_token_ids
         )
@@ -1757,9 +1777,38 @@ class Scheduler(SchedulerInterface):
             pre = spec_token_ids[: split_idx + 1]
             post = spec_token_ids[split_idx + 1 :]
             validated_post = metadata.grammar.validate_tokens(post)
-            return pre + validated_post
+            result = pre + validated_post
+            if len(result) != len(spec_token_ids):
+                logger.info(
+                    "[GRDBG] _validate_spec_tokens_with_reasoning: "
+                    "req=%s, TRIMMED %d->%d, split_idx=%d, "
+                    "grammar_state=%s, pre=%s, post=%s, "
+                    "validated_post=%s",
+                    request.request_id,
+                    len(spec_token_ids),
+                    len(result),
+                    split_idx,
+                    grammar_state,
+                    pre,
+                    post,
+                    validated_post,
+                )
+            return result
 
-        return metadata.grammar.validate_tokens(spec_token_ids)
+        result = metadata.grammar.validate_tokens(spec_token_ids)
+        if len(result) != len(spec_token_ids):
+            logger.info(
+                "[GRDBG] _validate_spec_tokens_with_reasoning: "
+                "req=%s, TRIMMED %d->%d (no reasoning split), "
+                "grammar_state=%s, spec=%s, validated=%s",
+                request.request_id,
+                len(spec_token_ids),
+                len(result),
+                grammar_state,
+                spec_token_ids,
+                result,
+            )
+        return result
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(

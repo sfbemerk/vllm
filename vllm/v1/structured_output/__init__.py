@@ -170,13 +170,36 @@ class StructuredOutputManager:
     ) -> None:
         assert self._grammar_bitmask is not None
         for grammar, index, apply_bitmask in batch:
-            if apply_bitmask and not grammar.is_terminated():
+            terminated = grammar.is_terminated()
+            if apply_bitmask and not terminated:
                 grammar.fill_bitmask(self._grammar_bitmask, index)
+                # Check if bitmask was actually constrained
+                bitmask_row = self._grammar_bitmask[index]
+                is_full = bool((bitmask_row == self._full_mask).all())
+                num_processed = getattr(grammar, "num_processed_tokens", "?")
+                if is_full:
+                    logger.info(
+                        "[GRDBG] _fill_bitmasks: idx=%d, "
+                        "GRAMMAR_FILL produced FULL_MASK "
+                        "(grammar allows all tokens at this state!), "
+                        "num_processed=%s, terminated=%s",
+                        index,
+                        num_processed,
+                        terminated,
+                    )
             else:
                 # Note that for thinking support, we will need to
                 # reset the relevant part of the bitmask for consequent
                 # requests here.
                 self._grammar_bitmask[index].fill_(self._full_mask)
+                num_processed = getattr(grammar, "num_processed_tokens", "?")
+                reason = "terminated" if terminated else "apply_bitmask=False"
+                logger.info(
+                    "[GRDBG] _fill_bitmasks: idx=%d, FULL_MASK (%s), num_processed=%s",
+                    index,
+                    reason,
+                    num_processed,
+                )
 
     def _async_submit_fill_bitmask(
         self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
@@ -256,6 +279,19 @@ class StructuredOutputManager:
                     assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
+                num_processed_start = getattr(grammar, "num_processed_tokens", "?")
+
+                logger.info(
+                    "[GRDBG] grammar_bitmask: req=%s, apply_bitmask=%s, "
+                    "reasoning_ended=%s, grammar_state=%s, "
+                    "terminated=%s, spec_tokens=%s",
+                    req_id,
+                    apply_bitmask,
+                    structured_output_request.reasoning_ended,
+                    num_processed_start,
+                    grammar.is_terminated() if grammar else "?",
+                    list(scheduled_spec_decode_tokens.get(req_id, ())),
+                )
 
                 # Determine where the reasoning_end token falls within
                 # the speculative tokens (if applicable). This handles
@@ -314,6 +350,19 @@ class StructuredOutputManager:
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
+                # Verify grammar state is back to where it started
+                num_processed_after = getattr(grammar, "num_processed_tokens", "?")
+                if num_processed_after != num_processed_start:
+                    logger.error(
+                        "[GRDBG] grammar_bitmask: req=%s STATE DESYNC! "
+                        "grammar_state before=%s after=%s "
+                        "(should be equal after rollback), "
+                        "state_advancements=%d",
+                        req_id,
+                        num_processed_start,
+                        num_processed_after,
+                        state_advancements,
+                    )
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:
@@ -323,6 +372,16 @@ class StructuredOutputManager:
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
         result_bitmask = bitmask_tensor.numpy()
+
+        # Summary: count FULL_MASK vs CONSTRAINED rows
+        num_masks = result_bitmask.shape[0]
+        full_count = sum(1 for i in range(num_masks) if np.all(result_bitmask[i] == -1))
+        logger.info(
+            "[GRDBG] grammar_bitmask: DONE, %d rows (%d full_mask, %d constrained)",
+            num_masks,
+            full_count,
+            num_masks - full_count,
+        )
         return result_bitmask
 
     def should_fill_bitmask(self, request: "Request") -> bool:
@@ -381,6 +440,13 @@ class StructuredOutputManager:
             all_token_ids = request.all_token_ids
             if self.reasoner.is_reasoning_end_streaming(all_token_ids, new_token_ids):
                 structured_req.reasoning_ended = True
+                logger.info(
+                    "[GRDBG] should_advance: req=%s, "
+                    "REASONING ENDED (via new_token_ids), "
+                    "new_token_ids=%s",
+                    getattr(request, "request_id", "?"),
+                    new_token_ids,
+                )
                 return True
         else:
             delta_from = request.num_computed_tokens - request.num_output_placeholders
@@ -391,6 +457,11 @@ class StructuredOutputManager:
                 # Reasoning just ended, so we shouldn't advance til
                 # next pass
                 structured_req.reasoning_ended = True
+                logger.info(
+                    "[GRDBG] should_advance: req=%s, "
+                    "REASONING ENDED (via delta), returning False",
+                    getattr(request, "request_id", "?"),
+                )
                 return False
 
         return False
@@ -442,7 +513,17 @@ class StructuredOutputManager:
             if idx is not None:
                 # The end marker is in new_token_ids — reasoning ended
                 # within this batch. Return tokens after the end marker.
-                return new_token_ids[idx + 1 :]
+                result = new_token_ids[idx + 1 :]
+                logger.info(
+                    "[GRDBG] get_tokens_after_reasoning: req=%s, "
+                    "end_marker at idx=%d, returning %d tokens "
+                    "after marker: %s",
+                    getattr(request, "request_id", "?"),
+                    idx,
+                    len(result),
+                    result,
+                )
+                return result
             else:
                 # End marker not in these tokens — reasoning ended before
                 # this batch. All tokens are post-reasoning.
