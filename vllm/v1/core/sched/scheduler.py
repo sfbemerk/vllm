@@ -1252,10 +1252,24 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        logger.info(
+            "[STRUCT_DEBUG] get_grammar_bitmask: structured_output_request_ids=%s, spec_decode_tokens=%s",
+            structured_output_request_ids,
+            {
+                k: v
+                for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
+                if k in structured_output_request_ids
+            },
+        )
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+        )
+        logger.info(
+            "[STRUCT_DEBUG] get_grammar_bitmask: bitmask_shape=%s, bitmask_dtype=%s",
+            bitmask.shape if bitmask is not None else None,
+            bitmask.dtype if bitmask is not None else None,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 

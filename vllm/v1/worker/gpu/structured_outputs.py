@@ -3,10 +3,13 @@
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 
 class StructuredOutputsWorker:
@@ -27,7 +30,16 @@ class StructuredOutputsWorker:
         grammar_req_ids: list[str],
         grammar_bitmask: np.ndarray,
     ) -> None:
+        logger.info(
+            "[STRUCT_DEBUG] apply_grammar_bitmask: grammar_req_ids=%s, bitmask_shape=%s, logits_shape=%s",
+            grammar_req_ids,
+            grammar_bitmask.shape if grammar_bitmask is not None else None,
+            logits.shape,
+        )
         if not grammar_req_ids:
+            logger.info(
+                "[STRUCT_DEBUG] apply_grammar_bitmask: no grammar_req_ids, returning early"
+            )
             return
 
         # Asynchronously copy the bitmask to GPU.
@@ -47,6 +59,13 @@ class StructuredOutputsWorker:
             logits_end_idx = cu_num_logits[req_idx + 1]
             mapping.extend(range(logits_start_idx, logits_end_idx))
 
+        logger.info(
+            "[STRUCT_DEBUG] apply_grammar_bitmask: req_ids=%s, cu_num_logits=%s, mapping=%s",
+            req_ids,
+            cu_num_logits,
+            mapping,
+        )
+
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
             logits_indices = torch.tensor(
@@ -63,6 +82,33 @@ class StructuredOutputsWorker:
         num_masks = bitmask.shape[0]
         assert num_masks == len(mapping)
         vocab_size = logits.shape[-1]
+
+        # Debug: Check bitmask content before applying
+        # A full_mask (all 1s = allow all) should have -1 values after xgrammar processing
+        # A constrained mask will have mixed 0s and 1s
+        bitmask_cpu = grammar_bitmask[:num_masks]
+        for i, mask_row in enumerate(bitmask_cpu):
+            # Check if all values are -1 (full_mask, allow all tokens)
+            if np.all(mask_row == -1):
+                logger.info(
+                    "[STRUCT_DEBUG] apply_grammar_bitmask: mask %d (logits_idx=%d) is FULL_MASK (allow all tokens)",
+                    i,
+                    mapping[i],
+                )
+            else:
+                # Count number of allowed tokens (bits set to 1)
+                # Each int32 has 32 bits; 1 means allowed, 0 means disallowed
+                # mask_row is already the bitmask (not the full_mask placeholder)
+                num_allowed = np.sum(
+                    [bin(int(v) & 0xFFFFFFFF).count("1") for v in mask_row]
+                )
+                logger.info(
+                    "[STRUCT_DEBUG] apply_grammar_bitmask: mask %d (logits_idx=%d) is CONSTRAINED, ~%d tokens allowed",
+                    i,
+                    mapping[i],
+                    num_allowed,
+                )
+
         BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
         _apply_grammar_bitmask_kernel[grid](
@@ -74,6 +120,29 @@ class StructuredOutputsWorker:
             vocab_size,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+
+        # Debug: After applying mask, check logits for a sample of positions
+        # This helps verify the mask was applied correctly
+        for i, logits_idx in enumerate(mapping[: min(3, len(mapping))]):
+            masked_logits = logits[logits_idx]
+            num_neg_inf = (masked_logits == float("-inf")).sum().item()
+            num_valid = vocab_size - num_neg_inf
+            mask_row = bitmask_cpu[i]
+            is_full_mask = np.all(mask_row == -1)
+            logger.info(
+                "[STRUCT_DEBUG] apply_grammar_bitmask: AFTER mask %d (logits_idx=%d), num_valid_tokens=%d, num_neg_inf=%d, was_full_mask=%s",
+                i,
+                logits_idx,
+                num_valid,
+                num_neg_inf,
+                is_full_mask,
+            )
+            # If full_mask was applied but we still have neg_inf values, something is wrong
+            if is_full_mask and num_neg_inf > 0:
+                logger.warning(
+                    "[STRUCT_DEBUG] apply_grammar_bitmask: BUG! full_mask was applied but %d tokens got -inf (should be 0)",
+                    num_neg_inf,
+                )
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them

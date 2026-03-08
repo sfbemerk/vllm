@@ -170,11 +170,20 @@ class StructuredOutputManager:
         assert self._grammar_bitmask is not None
         for grammar, index, apply_bitmask in batch:
             if apply_bitmask and not grammar.is_terminated():
+                logger.info(
+                    "[STRUCT_DEBUG] _fill_bitmasks: index=%d, apply_bitmask=True, filling grammar bitmask",
+                    index,
+                )
                 grammar.fill_bitmask(self._grammar_bitmask, index)
             else:
                 # Note that for thinking support, we will need to
                 # reset the relevant part of the bitmask for consequent
                 # requests here.
+                logger.info(
+                    "[STRUCT_DEBUG] _fill_bitmasks: index=%d, apply_bitmask=%s, filling with full_mask (all-1s)",
+                    index,
+                    apply_bitmask,
+                )
                 self._grammar_bitmask[index].fill_(self._full_mask)
 
     def _async_submit_fill_bitmask(
@@ -256,6 +265,14 @@ class StructuredOutputManager:
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
 
+                logger.info(
+                    "[STRUCT_DEBUG] grammar_bitmask: req=%s, apply_bitmask=%s, reasoning_ended=%s, spec_tokens=%s",
+                    req_id,
+                    apply_bitmask,
+                    structured_output_request.reasoning_ended,
+                    scheduled_spec_decode_tokens.get(req_id, ()),
+                )
+
                 # Determine where the reasoning_end token falls within
                 # the speculative tokens (if applicable). This handles
                 # two scenarios:
@@ -277,6 +294,12 @@ class StructuredOutputManager:
                     reasoning_end_idx = self.find_reasoning_end_in_tokens(
                         list(req_tokens)
                     )
+                    logger.info(
+                        "[STRUCT_DEBUG] grammar_bitmask: req=%s, req_tokens=%s, reasoning_end_idx=%s",
+                        req_id,
+                        list(req_tokens),
+                        reasoning_end_idx,
+                    )
 
                 state_advancements = 0
                 for tok_idx, token in enumerate(itertools.chain(req_tokens, (-1,))):
@@ -293,8 +316,23 @@ class StructuredOutputManager:
                             and not structured_output_request.reasoning_ended
                         ):
                             structured_output_request.reasoning_ended = True
+                            logger.info(
+                                "[STRUCT_DEBUG] grammar_bitmask: req=%s, tok_idx=%d > reasoning_end_idx=%d, setting reasoning_ended=True",
+                                req_id,
+                                tok_idx,
+                                reasoning_end_idx,
+                            )
                     else:
                         pos_apply_bitmask = apply_bitmask
+
+                    logger.info(
+                        "[STRUCT_DEBUG] grammar_bitmask: req=%s, tok_idx=%d, token=%s, pos_apply_bitmask=%s, cumulative_index=%d",
+                        req_id,
+                        tok_idx,
+                        token,
+                        pos_apply_bitmask,
+                        cumulative_index,
+                    )
 
                     self._fill_bitmasks(
                         ((grammar, cumulative_index, pos_apply_bitmask),)
@@ -322,7 +360,21 @@ class StructuredOutputManager:
         # After finishing with the xgrammar operations, we convert to
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
-        return bitmask_tensor.numpy()
+        result_bitmask = bitmask_tensor.numpy()
+
+        # Debug: Log summary of final bitmask
+        num_masks = result_bitmask.shape[0]
+        full_mask_count = sum(
+            1 for i in range(num_masks) if np.all(result_bitmask[i] == -1)
+        )
+        constrained_count = num_masks - full_mask_count
+        logger.info(
+            "[STRUCT_DEBUG] grammar_bitmask: FINAL result shape=%s, full_mask_count=%d (allow all), constrained_count=%d",
+            result_bitmask.shape,
+            full_mask_count,
+            constrained_count,
+        )
+        return result_bitmask
 
     def should_fill_bitmask(self, request: "Request") -> bool:
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that
@@ -330,6 +382,10 @@ class StructuredOutputManager:
         # enable the bitmask filling.
         if self.reasoner is not None:
             if self.enable_in_reasoning:
+                logger.info(
+                    "[STRUCT_DEBUG] should_fill_bitmask: req=%s, enable_in_reasoning=True, returning True",
+                    request.request_id,
+                )
                 return True
             assert request.structured_output_request is not None
             if request.structured_output_request.reasoning_ended is None:
@@ -340,7 +396,18 @@ class StructuredOutputManager:
                 request.structured_output_request.reasoning_ended = (
                     self.reasoner.is_reasoning_end(request.prompt_token_ids or [])
                 )
-            return request.structured_output_request.reasoning_ended
+            result = request.structured_output_request.reasoning_ended
+            logger.info(
+                "[STRUCT_DEBUG] should_fill_bitmask: req=%s, reasoning_ended=%s, returning %s",
+                request.request_id,
+                request.structured_output_request.reasoning_ended,
+                result,
+            )
+            return result
+        logger.info(
+            "[STRUCT_DEBUG] should_fill_bitmask: req=%s, no reasoner, returning True",
+            request.request_id,
+        )
         return True
 
     def should_advance(
@@ -367,6 +434,10 @@ class StructuredOutputManager:
 
         structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
+            logger.info(
+                "[STRUCT_DEBUG] should_advance: req=%s, reasoning_ended=True, returning True",
+                request.request_id,
+            )
             return True
 
         # Check if reasoning ends in *this* step.
@@ -379,6 +450,11 @@ class StructuredOutputManager:
             all_token_ids = request.all_token_ids
             if self.reasoner.is_reasoning_end_streaming(all_token_ids, new_token_ids):
                 structured_req.reasoning_ended = True
+                logger.info(
+                    "[STRUCT_DEBUG] should_advance: req=%s, reasoning ended in new_token_ids=%s, returning True",
+                    request.request_id,
+                    new_token_ids,
+                )
                 return True
         else:
             delta_from = request.num_computed_tokens - request.num_output_placeholders
@@ -389,7 +465,16 @@ class StructuredOutputManager:
                 # Reasoning just ended, so we shouldn't advance til
                 # next pass
                 structured_req.reasoning_ended = True
+                logger.info(
+                    "[STRUCT_DEBUG] should_advance: req=%s, reasoning just ended in delta tokens, returning False (will advance next pass)",
+                    request.request_id,
+                )
+                return False
 
+        logger.info(
+            "[STRUCT_DEBUG] should_advance: req=%s, reasoning not ended, returning False",
+            request.request_id,
+        )
         return False
 
     def find_reasoning_end_in_tokens(self, token_ids: list[int]) -> int | None:
