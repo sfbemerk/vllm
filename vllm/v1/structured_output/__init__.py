@@ -307,22 +307,15 @@ class StructuredOutputManager:
                     # Determine whether grammar applies at this position.
                     # Tokens up to and including reasoning_end are
                     # unconstrained; tokens after are grammar-constrained.
+                    #
+                    # NOTE: We do NOT set reasoning_ended=True here because
+                    # these are DRAFT tokens that may be rejected during
+                    # rejection sampling. The reasoning_ended flag should
+                    # only be set in should_advance() AFTER rejection sampling
+                    # has confirmed which tokens were actually accepted.
                     if reasoning_end_idx is not None:
                         is_post_reasoning = tok_idx > reasoning_end_idx
                         pos_apply_bitmask = is_post_reasoning
-                        # Once we pass the reasoning_end position, mark
-                        # reasoning as ended so subsequent steps know.
-                        if (
-                            is_post_reasoning
-                            and not structured_output_request.reasoning_ended
-                        ):
-                            structured_output_request.reasoning_ended = True
-                            logger.info(
-                                "[STRUCT_DEBUG] grammar_bitmask: req=%s, tok_idx=%d > reasoning_end_idx=%d, setting reasoning_ended=True",
-                                req_id,
-                                tok_idx,
-                                reasoning_end_idx,
-                            )
                     else:
                         pos_apply_bitmask = apply_bitmask
 
