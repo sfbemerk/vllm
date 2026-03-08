@@ -1235,12 +1235,22 @@ class Scheduler(SchedulerInterface):
             external_load_encoder_input,
         )
 
+    _grammar_step_counter: int = 0
+
     def get_grammar_bitmask(
         self, scheduler_output: SchedulerOutput
     ) -> GrammarOutput | None:
+        Scheduler._grammar_step_counter += 1
+        step_id = Scheduler._grammar_step_counter
+
         # Collect list of scheduled request ids that use structured output.
         # The corresponding rows of the bitmask will be in this order.
         if not scheduler_output.has_structured_output_requests:
+            logger.info(
+                "[GRDBG] get_grammar_bitmask: step=%d, "
+                "SKIP (no structured output requests in batch)",
+                step_id,
+            )
             return None
 
         structured_output_request_ids = [
@@ -1250,7 +1260,31 @@ class Scheduler(SchedulerInterface):
             and (req.use_structured_output and not req.is_prefill_chunk)
         ]
         if not structured_output_request_ids:
+            logger.info(
+                "[GRDBG] get_grammar_bitmask: step=%d, "
+                "SKIP (all structured reqs are prefill or missing), "
+                "scheduled_reqs=%s",
+                step_id,
+                list(scheduler_output.num_scheduled_tokens.keys()),
+            )
             return None
+
+        logger.info(
+            "[GRDBG] get_grammar_bitmask: step=%d, "
+            "generating bitmask for %d reqs: %s, "
+            "spec_tokens=%s",
+            step_id,
+            len(structured_output_request_ids),
+            structured_output_request_ids,
+            {
+                k: v
+                for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
+                if k in structured_output_request_ids
+            },
+        )
+        # Stamp step_id on scheduler_output for correlation
+        # with update_from_output logs.
+        scheduler_output._grdbg_step_id = step_id  # type: ignore[attr-defined]
 
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
@@ -1264,6 +1298,11 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        _grdbg_step = getattr(scheduler_output, "_grdbg_step_id", "?")
+        logger.info(
+            "[GRDBG] update_from_output: processing output from step=%s",
+            _grdbg_step,
+        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
