@@ -1252,24 +1252,10 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
-        logger.info(
-            "[STRUCT_DEBUG] get_grammar_bitmask: structured_output_request_ids=%s, spec_decode_tokens=%s",
-            structured_output_request_ids,
-            {
-                k: v
-                for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
-                if k in structured_output_request_ids
-            },
-        )
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
-        )
-        logger.info(
-            "[STRUCT_DEBUG] get_grammar_bitmask: bitmask_shape=%s, bitmask_dtype=%s",
-            bitmask.shape if bitmask is not None else None,
-            bitmask.dtype if bitmask is not None else None,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -1625,6 +1611,43 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    def _should_validate_draft_tokens(
+        self, request: Request, spec_token_ids: list[int]
+    ) -> bool:
+        """Check if draft tokens need grammar validation, WITHOUT mutating
+        reasoning_ended state.
+
+        Draft tokens are speculative and may be rejected during rejection
+        sampling. We must not permanently set reasoning_ended=True based on
+        unverified tokens. Instead, we determine whether validation is needed
+        by checking:
+        1. If reasoning already ended (from previously accepted tokens), all
+           draft tokens need validation.
+        2. If reasoning hasn't ended yet, check if the reasoning-end marker
+           appears in the draft tokens. If so, only the tokens after the
+           marker need validation (handled by _validate_spec_tokens_with_reasoning).
+        3. If no reasoning-end marker is found, no validation is needed.
+        """
+        if not request.use_structured_output:
+            return False
+
+        so_manager = self.structured_output_manager
+        if so_manager.reasoner is None:
+            return True
+
+        if so_manager.enable_in_reasoning:
+            return True
+
+        assert request.structured_output_request is not None
+        if request.structured_output_request.reasoning_ended:
+            return True
+
+        # Check if reasoning end appears in the draft tokens themselves.
+        # This does NOT set reasoning_ended - that only happens when the
+        # tokens are confirmed accepted in update_from_output.
+        reasoning_end_idx = so_manager.find_reasoning_end_in_tokens(spec_token_ids)
+        return reasoning_end_idx is not None
+
     def _validate_spec_tokens_with_reasoning(
         self, request: Request, spec_token_ids: list[int]
     ) -> list[int]:
@@ -1666,11 +1689,13 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            # Pass spec_token_ids to should_advance so it can detect
-            # reasoning_end within the draft tokens.
-            if self.structured_output_manager.should_advance(
-                request, new_token_ids=spec_token_ids
-            ):
+            # NOTE: We must NOT call should_advance() here because draft
+            # tokens are speculative and may be rejected during rejection
+            # sampling. Setting reasoning_ended=True based on unverified
+            # drafts would permanently and incorrectly enable grammar
+            # constraints. Instead, we check whether grammar validation
+            # is needed without mutating the reasoning_ended state.
+            if self._should_validate_draft_tokens(request, spec_token_ids):
                 spec_token_ids = self._validate_spec_tokens_with_reasoning(
                     request, spec_token_ids
                 )
@@ -1700,11 +1725,13 @@ class Scheduler(SchedulerInterface):
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
             # Filter out spec tokens which do not adhere to the grammar.
-            # Pass spec_token_ids to should_advance so it can detect
-            # reasoning_end within the draft tokens.
-            if self.structured_output_manager.should_advance(
-                request, new_token_ids=spec_token_ids
-            ):
+            # NOTE: We must NOT call should_advance() here because draft
+            # tokens are speculative and may be rejected during rejection
+            # sampling. Setting reasoning_ended=True based on unverified
+            # drafts would permanently and incorrectly enable grammar
+            # constraints. Instead, we check whether grammar validation
+            # is needed without mutating the reasoning_ended state.
+            if self._should_validate_draft_tokens(request, spec_token_ids):
                 spec_token_ids = self._validate_spec_tokens_with_reasoning(
                     request, spec_token_ids
                 )

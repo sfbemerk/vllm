@@ -323,7 +323,10 @@ class TestReasoningStructuredOutput:
     ):
         """When reasoning_end appears mid-speculation, only post-reasoning
         tokens should be grammar-constrained and accepted (then rolled
-        back)."""
+        back).  grammar_bitmask() must NOT permanently set reasoning_ended
+        because draft tokens have not yet been verified by rejection
+        sampling; reasoning_ended is only set later by update_from_output()
+        once the tokens are confirmed accepted."""
         manager = self._make_manager_for_bitmask_test(
             mock_vllm_config, mock_reasoning_parser, num_spec_tokens=5
         )
@@ -357,7 +360,7 @@ class TestReasoningStructuredOutput:
         )
 
         assert result is not None
-        assert request.structured_output_request.reasoning_ended is True
+        assert request.structured_output_request.reasoning_ended is False
 
         # Only post-reasoning tokens should have been accepted
         accepted_tokens = [
