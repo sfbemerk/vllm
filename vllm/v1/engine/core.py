@@ -557,9 +557,9 @@ class EngineCore:
                 assert draft_token_ids is not None
                 logger.info(
                     "[GRDBG] step_with_batch_queue(): DEFERRED spec decode - "
-                    "got %d draft_token_id entries, calling "
+                    "got %d draft_token_id req entries, calling "
                     "update_draft_token_ids_in_output",
-                    len(draft_token_ids),
+                    len(draft_token_ids.req_ids),
                 )
                 # Update the draft token ids in the scheduler output to
                 # filter out the invalid spec tokens, which will be padded
