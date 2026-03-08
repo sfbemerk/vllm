@@ -152,18 +152,42 @@ class XgrammarGrammar(StructuredOutputGrammar):
         Returns False if the FSM failed to advance.
         """
         if self._is_terminated:
+            logger.info(
+                "[GRDBG] accept_tokens: req=%s SKIP (terminated), "
+                "num_processed=%d, tokens=%s",
+                request_id,
+                self.num_processed_tokens,
+                tokens,
+            )
             return False
-        for token in tokens:
+        state_before = self.num_processed_tokens
+        for i, token in enumerate(tokens):
             if not self.matcher.accept_token(token):
                 logger.error(
-                    "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.",
+                    "[GRDBG] accept_tokens: req=%s FAIL at token[%d]=%d, "
+                    "num_processed_before=%d, advanced=%d, "
+                    "partial_state_NOT_rolled_back! tokens=%s",
                     request_id,
+                    i,
                     token,
+                    state_before,
+                    i,
+                    tokens,
                 )
+                # BUG: grammar is now partially advanced by i tokens
+                # but we return False without rolling back.
                 return False
             self.num_processed_tokens += 1
         self._is_terminated = self.matcher.is_terminated()
+        logger.info(
+            "[GRDBG] accept_tokens: req=%s OK, num_processed=%d->%d, "
+            "terminated=%s, tokens=%s",
+            request_id,
+            state_before,
+            self.num_processed_tokens,
+            self._is_terminated,
+            tokens,
+        )
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -172,6 +196,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
+        state_before = self.num_processed_tokens
         accepted_tokens = []
         for token in tokens:
             if self.matcher.accept_token(token):
@@ -181,12 +206,36 @@ class XgrammarGrammar(StructuredOutputGrammar):
         if len(accepted_tokens) > 0:
             # Rollback the FSM to the initial state
             self.matcher.rollback(len(accepted_tokens))
+        if len(accepted_tokens) != len(tokens):
+            logger.info(
+                "[GRDBG] validate_tokens: TRIMMED %d->%d, "
+                "num_processed=%d (unchanged), "
+                "rejected_at=%d token=%s, tokens=%s",
+                len(tokens),
+                len(accepted_tokens),
+                state_before,
+                len(accepted_tokens),
+                tokens[len(accepted_tokens)]
+                if len(accepted_tokens) < len(tokens)
+                else "?",
+                tokens,
+            )
         return accepted_tokens
 
     def rollback(self, num_tokens: int) -> None:
+        state_before = self.num_processed_tokens
+        terminated_before = self._is_terminated
         self.matcher.rollback(num_tokens)
         self.num_processed_tokens -= num_tokens
         self._is_terminated = self.matcher.is_terminated()
+        logger.info(
+            "[GRDBG] rollback: n=%d, num_processed=%d->%d, terminated=%s->%s",
+            num_tokens,
+            state_before,
+            self.num_processed_tokens,
+            terminated_before,
+            self._is_terminated,
+        )
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
