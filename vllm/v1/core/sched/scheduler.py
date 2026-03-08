@@ -1355,6 +1355,26 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # When using speculative decoding with structured output and
+            # reasoning: if the target model resampled </think> at a
+            # position where the bitmask was not expecting it (e.g. the
+            # draft tokens didn't contain </think> or had it at a later
+            # position), tokens after </think> may have been sampled
+            # without grammar constraints.  Truncate to just after
+            # </think> so the next step re-generates those tokens with
+            # proper grammar constraints.
+            if (
+                scheduled_spec_token_ids
+                and new_token_ids
+                and request.use_structured_output
+                and not request.structured_output_request.reasoning_ended
+            ):
+                new_token_ids = self._truncate_unconstrained_post_reasoning_tokens(
+                    new_token_ids,
+                    scheduled_spec_token_ids,
+                    request,
+                )
+
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1610,6 +1630,75 @@ class Scheduler(SchedulerInterface):
                 # The encoder output is already processed and stored
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
+
+    def _truncate_unconstrained_post_reasoning_tokens(
+        self,
+        new_token_ids: list[int],
+        scheduled_spec_token_ids: list[int],
+        request: Request,
+    ) -> list[int]:
+        """Truncate tokens after an unexpected reasoning-end marker.
+
+        During speculative decoding, the grammar bitmask is pre-computed
+        based on the draft tokens.  If the target model's rejection
+        sampling produces </think> at a position where the draft did not
+        have it (or at an earlier position), the bitmask rows after that
+        point were all-unconstrained.  Any tokens sampled at those
+        positions were not grammar-constrained and must be discarded so
+        the next step can re-generate them properly.
+
+        Returns *new_token_ids* unchanged when no truncation is needed,
+        or a truncated copy that keeps only tokens up to and including
+        the reasoning-end marker.
+        """
+        so_mgr = self.structured_output_manager
+        if so_mgr.reasoner is None or so_mgr.enable_in_reasoning:
+            return new_token_ids
+
+        end_in_accepted = so_mgr.find_reasoning_end_in_tokens(new_token_ids)
+        if end_in_accepted is None:
+            # No reasoning-end in the accepted tokens — nothing to do.
+            return new_token_ids
+
+        end_in_drafts = so_mgr.find_reasoning_end_in_tokens(scheduled_spec_token_ids)
+
+        # If reasoning-end is at the same or later position in the
+        # accepted tokens compared to the drafts, the bitmask was
+        # correct for the positions that follow.  Only truncate when the
+        # accepted reasoning-end is earlier than expected (or absent
+        # from the drafts entirely).
+        if end_in_drafts is not None and end_in_accepted >= end_in_drafts:
+            return new_token_ids
+
+        # Truncate: keep tokens up to and including the reasoning-end
+        # marker.  The tokens after it were sampled without grammar
+        # constraints and will be re-generated in the next step.
+        truncate_at = end_in_accepted + 1
+        num_discarded = len(new_token_ids) - truncate_at
+        if num_discarded <= 0:
+            return new_token_ids
+
+        logger.debug(
+            "Truncating %d unconstrained post-reasoning tokens for "
+            "request %s (reasoning_end at accepted pos %d, draft pos %s)",
+            num_discarded,
+            request.request_id,
+            end_in_accepted,
+            end_in_drafts,
+        )
+
+        new_token_ids = new_token_ids[:truncate_at]
+
+        # Adjust bookkeeping: the discarded tokens were already
+        # counted as "computed" during the earlier rejection-sampling
+        # adjustment (they were accepted by the target model).  Undo
+        # that for the tokens we're now discarding.
+        if request.num_computed_tokens > 0:
+            request.num_computed_tokens -= num_discarded
+        if request.num_output_placeholders > 0:
+            request.num_output_placeholders -= num_discarded
+
+        return new_token_ids
 
     def _should_validate_draft_tokens(
         self, request: Request, spec_token_ids: list[int]

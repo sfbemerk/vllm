@@ -410,3 +410,161 @@ class TestReasoningStructuredOutput:
         grammar.accept_tokens.assert_not_called()
         grammar.fill_bitmask.assert_not_called()
         assert request.structured_output_request.reasoning_ended is False
+
+    def test_find_reasoning_end_detects_position_mismatch(
+        self,
+        mock_vllm_config,
+        mock_reasoning_parser,
+    ):
+        """Verify find_reasoning_end_in_tokens detects when </think>
+        appears at different positions in draft vs accepted tokens.
+
+        This is the condition that triggers truncation of
+        unconstrained post-reasoning tokens: the target model
+        resampled </think> at an earlier position than the drafter
+        predicted (or the drafter didn't include it at all), so the
+        bitmask rows after </think> were all-unconstrained."""
+        manager = StructuredOutputManager(mock_vllm_config)
+
+        def mock_streaming(all_ids, delta):
+            return THINK_END_TOKEN in delta
+
+        mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
+        manager.reasoner = mock_reasoning_parser
+
+        # Case 1: </think> not in drafts, but in accepted
+        draft_tokens = [REASONING_TOKEN_A, REASONING_TOKEN_B]
+        accepted_tokens = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
+        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
+        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
+        assert end_in_drafts is None
+        assert end_in_accepted == 0
+        # Condition: truncation needed (drafts had no reasoning end)
+
+        # Case 2: </think> at position 2 in drafts, position 0 in accepted
+        draft_tokens = [REASONING_TOKEN_A, REASONING_TOKEN_B, THINK_END_TOKEN]
+        accepted_tokens = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
+        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
+        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
+        assert end_in_drafts == 2
+        assert end_in_accepted == 0
+        assert end_in_accepted < end_in_drafts
+        # Condition: truncation needed (accepted end earlier than draft)
+
+        # Case 3: </think> at same position — no truncation needed
+        draft_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
+        accepted_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_B]
+        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
+        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
+        assert end_in_drafts == 1
+        assert end_in_accepted == 1
+        # No truncation: end_in_accepted >= end_in_drafts
+
+        # Case 4: </think> later in accepted than in drafts — no truncation
+        draft_tokens = [THINK_END_TOKEN, JSON_TOKEN_A]
+        accepted_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
+        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
+        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
+        assert end_in_drafts == 0
+        assert end_in_accepted == 1
+        assert end_in_accepted >= end_in_drafts
+        # No truncation: accepted end is at or after draft end
+
+    def test_truncate_unconstrained_post_reasoning_tokens(
+        self,
+        mock_vllm_config,
+        mock_reasoning_parser,
+    ):
+        """Test that _truncate_unconstrained_post_reasoning_tokens correctly
+        truncates tokens when </think> appears unexpectedly in accepted
+        tokens.
+
+        Scenario: EAGLE drafts [tok_A, tok_B, tok_C] (no </think>), but
+        the target model resamples and produces [</think>, json1, json2].
+        The bitmask was all-unconstrained, so json1 and json2 must be
+        discarded."""
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        manager = StructuredOutputManager(mock_vllm_config)
+
+        def mock_streaming(all_ids, delta):
+            return THINK_END_TOKEN in delta
+
+        mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
+        manager.reasoner = mock_reasoning_parser
+
+        # Build a minimal mock scheduler with the structured output manager
+        mock_scheduler = Mock(spec=Scheduler)
+        mock_scheduler.structured_output_manager = manager
+        # Bind the real method to the mock
+        mock_scheduler._truncate_unconstrained_post_reasoning_tokens = (
+            Scheduler._truncate_unconstrained_post_reasoning_tokens.__get__(
+                mock_scheduler
+            )
+        )
+
+        request = Mock(spec=Request)
+        request.request_id = "req-test-truncate"
+        request.num_computed_tokens = 10
+        request.num_output_placeholders = 5
+
+        # Case 1: </think> not in drafts, at position 0 in accepted
+        # → truncate to just [THINK_END_TOKEN]
+        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
+        accepted = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
+        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
+            accepted, draft, request
+        )
+        assert result == [THINK_END_TOKEN]
+        assert request.num_computed_tokens == 8  # 10 - 2 discarded
+        assert request.num_output_placeholders == 3  # 5 - 2 discarded
+
+        # Reset counters
+        request.num_computed_tokens = 10
+        request.num_output_placeholders = 5
+
+        # Case 2: </think> at position 2 in drafts, position 0 in accepted
+        # → truncate to just [THINK_END_TOKEN]
+        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B, THINK_END_TOKEN]
+        accepted = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
+        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
+            accepted, draft, request
+        )
+        assert result == [THINK_END_TOKEN]
+        assert request.num_computed_tokens == 8
+        assert request.num_output_placeholders == 3
+
+        # Reset counters
+        request.num_computed_tokens = 10
+        request.num_output_placeholders = 5
+
+        # Case 3: </think> at same position in both → no truncation
+        draft = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
+        accepted = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_B]
+        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
+            accepted, draft, request
+        )
+        assert result == accepted  # unchanged
+        assert request.num_computed_tokens == 10  # unchanged
+        assert request.num_output_placeholders == 5  # unchanged
+
+        # Case 4: no </think> in accepted → no truncation
+        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
+        accepted = [REASONING_TOKEN_A, REASONING_TOKEN_B, JSON_TOKEN_A]
+        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
+            accepted, draft, request
+        )
+        assert result == accepted  # unchanged
+
+        # Case 5: </think> is the last accepted token → no actual
+        # discarding needed (nothing after it)
+        request.num_computed_tokens = 10
+        request.num_output_placeholders = 5
+        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
+        accepted = [REASONING_TOKEN_A, THINK_END_TOKEN]
+        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
+            accepted, draft, request
+        )
+        assert result == [REASONING_TOKEN_A, THINK_END_TOKEN]
+        assert request.num_computed_tokens == 10  # no change, nothing discarded
+        assert request.num_output_placeholders == 5
