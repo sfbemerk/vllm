@@ -7,7 +7,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.import_utils import LazyLoader
@@ -17,7 +16,6 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputGrammar,
 )
 from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
-import numpy as np
 
 if TYPE_CHECKING:
     import numpy as np
@@ -28,9 +26,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 else:
     torch = LazyLoader("torch", globals(), "torch")
-
-
-logger = init_logger(__name__)
 
 
 class StructuredOutputManager:
@@ -173,33 +168,11 @@ class StructuredOutputManager:
             terminated = grammar.is_terminated()
             if apply_bitmask and not terminated:
                 grammar.fill_bitmask(self._grammar_bitmask, index)
-                # Check if bitmask was actually constrained
-                bitmask_row = self._grammar_bitmask[index]
-                is_full = bool((bitmask_row == self._full_mask).all())
-                num_processed = getattr(grammar, "num_processed_tokens", "?")
-                if is_full:
-                    logger.info(
-                        "[GRDBG] _fill_bitmasks: idx=%d, "
-                        "GRAMMAR_FILL produced FULL_MASK "
-                        "(grammar allows all tokens at this state!), "
-                        "num_processed=%s, terminated=%s",
-                        index,
-                        num_processed,
-                        terminated,
-                    )
             else:
                 # Note that for thinking support, we will need to
                 # reset the relevant part of the bitmask for consequent
                 # requests here.
                 self._grammar_bitmask[index].fill_(self._full_mask)
-                num_processed = getattr(grammar, "num_processed_tokens", "?")
-                reason = "terminated" if terminated else "apply_bitmask=False"
-                logger.debug(
-                    "[GRDBG] _fill_bitmasks: idx=%d, FULL_MASK (%s), num_processed=%s",
-                    index,
-                    reason,
-                    num_processed,
-                )
 
     def _async_submit_fill_bitmask(
         self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
@@ -279,36 +252,20 @@ class StructuredOutputManager:
                     assert structured_output_request.grammar is not None
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
-                num_processed_start = getattr(grammar, "num_processed_tokens", "?")
-
-                logger.debug(
-                    "[GRDBG] grammar_bitmask: req=%s, apply_bitmask=%s, "
-                    "reasoning_ended=%s, grammar_state=%s, "
-                    "terminated=%s, spec_tokens=%s",
-                    req_id,
-                    apply_bitmask,
-                    structured_output_request.reasoning_ended,
-                    num_processed_start,
-                    grammar.is_terminated() if grammar else "?",
-                    list(scheduled_spec_decode_tokens.get(req_id, ())),
-                )
-
                 # Determine where the reasoning_end token falls within
-                # the speculative tokens (if applicable). This handles
-                # two scenarios:
-                # 1. Reasoning not yet ended (apply_bitmask=False): the
-                #    reasoning_end token may appear mid-speculation;
-                #    positions after it need grammar constraints.
-                # 2. Reasoning already ended (apply_bitmask=True): the
-                #    spec tokens from the previous step may contain the
-                #    reasoning_end token; the grammar must NOT accept
-                #    reasoning tokens (up to and including the end
-                #    marker).
+                # the speculative tokens (if applicable). When reasoning
+                # hasn't ended yet, the reasoning_end token may appear
+                # mid-speculation; positions after it need grammar
+                # constraints.
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 reasoning_end_idx: int | None = None
                 if (
                     self.reasoner is not None
                     and not self.enable_in_reasoning
+                    and not apply_bitmask  # Only search when reasoning
+                    # hasn't ended yet. When reasoning already ended
+                    # (apply_bitmask=True), any </think> in drafts is
+                    # spurious and all positions must be constrained.
                     and req_tokens
                 ):
                     reasoning_end_idx = self.find_reasoning_end_in_tokens(
@@ -350,19 +307,6 @@ class StructuredOutputManager:
                     cumulative_index += 1
                 if state_advancements > 0:
                     grammar.rollback(state_advancements)
-                # Verify grammar state is back to where it started
-                num_processed_after = getattr(grammar, "num_processed_tokens", "?")
-                if num_processed_after != num_processed_start:
-                    logger.error(
-                        "[GRDBG] grammar_bitmask: req=%s STATE DESYNC! "
-                        "grammar_state before=%s after=%s "
-                        "(should be equal after rollback), "
-                        "state_advancements=%d",
-                        req_id,
-                        num_processed_start,
-                        num_processed_after,
-                        state_advancements,
-                    )
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:
@@ -372,16 +316,6 @@ class StructuredOutputManager:
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
         result_bitmask = bitmask_tensor.numpy()
-
-        # Summary: count FULL_MASK vs CONSTRAINED rows
-        num_masks = result_bitmask.shape[0]
-        full_count = sum(1 for i in range(num_masks) if np.all(result_bitmask[i] == -1))
-        logger.debug(
-            "[GRDBG] grammar_bitmask: DONE, %d rows (%d full_mask, %d constrained)",
-            num_masks,
-            full_count,
-            num_masks - full_count,
-        )
         return result_bitmask
 
     def should_fill_bitmask(self, request: "Request") -> bool:
@@ -440,13 +374,6 @@ class StructuredOutputManager:
             all_token_ids = request.all_token_ids
             if self.reasoner.is_reasoning_end_streaming(all_token_ids, new_token_ids):
                 structured_req.reasoning_ended = True
-                logger.info(
-                    "[GRDBG] should_advance: req=%s, "
-                    "REASONING ENDED (via new_token_ids), "
-                    "new_token_ids=%s",
-                    getattr(request, "request_id", "?"),
-                    new_token_ids,
-                )
                 return True
         else:
             delta_from = request.num_computed_tokens - request.num_output_placeholders
@@ -457,11 +384,6 @@ class StructuredOutputManager:
                 # Reasoning just ended, so we shouldn't advance til
                 # next pass
                 structured_req.reasoning_ended = True
-                logger.info(
-                    "[GRDBG] should_advance: req=%s, "
-                    "REASONING ENDED (via delta), returning False",
-                    getattr(request, "request_id", "?"),
-                )
                 return False
 
         return False
@@ -513,19 +435,7 @@ class StructuredOutputManager:
             if idx is not None:
                 # The end marker is in new_token_ids — reasoning ended
                 # within this batch. Return tokens after the end marker.
-                result = new_token_ids[idx + 1 :]
-                logger.warning(
-                    "[GRDBG] get_tokens_after_reasoning: req=%s, "
-                    "BOUNDARY STEP - end_marker at idx=%d in "
-                    "new_token_ids=%s, %d tokens AFTER marker "
-                    "were sampled WITHOUT grammar constraint: %s",
-                    getattr(request, "request_id", "?"),
-                    idx,
-                    new_token_ids,
-                    len(result),
-                    result,
-                )
-                return result
+                return new_token_ids[idx + 1 :]
             else:
                 # End marker not in these tokens — reasoning ended before
                 # this batch. All tokens are post-reasoning.

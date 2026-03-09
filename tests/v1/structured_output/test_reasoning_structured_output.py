@@ -273,14 +273,20 @@ class TestReasoningStructuredOutput:
         mock_vllm_config,
         mock_reasoning_parser,
     ):
-        """Regression test for production crash: when reasoning_ended=True
-        and spec tokens contain </think>, grammar must NOT try to accept
-        the </think> token.
+        """When reasoning_ended=True and spec tokens contain </think>,
+        grammar_bitmask should treat ALL positions as grammar-constrained.
 
-        Production scenario: previous step set reasoning_ended=True,
-        should_fill_bitmask returns True, spec tokens = [</think>],
-        grammar.accept_tokens(</think>) crashes because </think> is not
-        valid structured output."""
+        The </think> token in spec tokens is spurious (from the EAGLE
+        drafter). It should NOT create an unconstrained reasoning split.
+        Instead, it is treated as a normal grammar token. If the grammar
+        accepts it (as in this test's mock), it gets constrained; if
+        the grammar rejects it, _validate_spec_tokens_with_reasoning
+        would have already replaced it with -1 before reaching here.
+
+        Note: In the previous (buggy) code, this test verified that
+        </think> was NOT passed to accept_tokens. With the root cause
+        fix, all positions are constrained, so </think> IS passed to
+        accept_tokens (and then rolled back)."""
         manager = self._make_manager_for_bitmask_test(
             mock_vllm_config, mock_reasoning_parser, num_spec_tokens=1
         )
@@ -307,14 +313,13 @@ class TestReasoningStructuredOutput:
             scheduled_spec_decode_tokens={req_id: [THINK_END_TOKEN]},
         )
 
-        # grammar.accept_tokens must NOT have been called with </think>
-        for call in grammar.accept_tokens.call_args_list:
-            _, tokens = call[0]
-            assert THINK_END_TOKEN not in tokens, (
-                f"grammar.accept_tokens was called with </think> token "
-                f"{THINK_END_TOKEN}, which should be skipped"
-            )
         assert result is not None
+
+        # With reasoning_ended=True, all positions are constrained.
+        # The </think> token should be passed to accept_tokens (and
+        # rolled back), not skipped as unconstrained.
+        assert grammar.accept_tokens.call_count == 1
+        grammar.rollback.assert_called_once_with(1)
 
     def test_grammar_bitmask_reasoning_ends_mid_speculation(
         self,
@@ -411,78 +416,19 @@ class TestReasoningStructuredOutput:
         grammar.fill_bitmask.assert_not_called()
         assert request.structured_output_request.reasoning_ended is False
 
-    def test_find_reasoning_end_detects_position_mismatch(
+    def test_validate_spec_tokens_skips_reasoning_search_when_ended(
         self,
         mock_vllm_config,
         mock_reasoning_parser,
     ):
-        """Verify find_reasoning_end_in_tokens detects when </think>
-        appears at different positions in draft vs accepted tokens.
+        """Root cause regression test: when reasoning_ended=True,
+        _validate_spec_tokens_with_reasoning must NOT search for </think>
+        in draft tokens. A spurious </think> from the EAGLE drafter must
+        be treated as a regular (invalid) grammar token, not as a
+        reasoning boundary.
 
-        This is the condition that triggers truncation of
-        unconstrained post-reasoning tokens: the target model
-        resampled </think> at an earlier position than the drafter
-        predicted (or the drafter didn't include it at all), so the
-        bitmask rows after </think> were all-unconstrained."""
-        manager = StructuredOutputManager(mock_vllm_config)
-
-        def mock_streaming(all_ids, delta):
-            return THINK_END_TOKEN in delta
-
-        mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
-        manager.reasoner = mock_reasoning_parser
-
-        # Case 1: </think> not in drafts, but in accepted
-        draft_tokens = [REASONING_TOKEN_A, REASONING_TOKEN_B]
-        accepted_tokens = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
-        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
-        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
-        assert end_in_drafts is None
-        assert end_in_accepted == 0
-        # Condition: truncation needed (drafts had no reasoning end)
-
-        # Case 2: </think> at position 2 in drafts, position 0 in accepted
-        draft_tokens = [REASONING_TOKEN_A, REASONING_TOKEN_B, THINK_END_TOKEN]
-        accepted_tokens = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
-        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
-        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
-        assert end_in_drafts == 2
-        assert end_in_accepted == 0
-        assert end_in_accepted < end_in_drafts
-        # Condition: truncation needed (accepted end earlier than draft)
-
-        # Case 3: </think> at same position — no truncation needed
-        draft_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
-        accepted_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_B]
-        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
-        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
-        assert end_in_drafts == 1
-        assert end_in_accepted == 1
-        # No truncation: end_in_accepted >= end_in_drafts
-
-        # Case 4: </think> later in accepted than in drafts — no truncation
-        draft_tokens = [THINK_END_TOKEN, JSON_TOKEN_A]
-        accepted_tokens = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
-        end_in_drafts = manager.find_reasoning_end_in_tokens(draft_tokens)
-        end_in_accepted = manager.find_reasoning_end_in_tokens(accepted_tokens)
-        assert end_in_drafts == 0
-        assert end_in_accepted == 1
-        assert end_in_accepted >= end_in_drafts
-        # No truncation: accepted end is at or after draft end
-
-    def test_truncate_unconstrained_post_reasoning_tokens(
-        self,
-        mock_vllm_config,
-        mock_reasoning_parser,
-    ):
-        """Test that _truncate_unconstrained_post_reasoning_tokens correctly
-        truncates tokens when </think> appears unexpectedly in accepted
-        tokens.
-
-        Scenario: EAGLE drafts [tok_A, tok_B, tok_C] (no </think>), but
-        the target model resamples and produces [</think>, json1, json2].
-        The bitmask was all-unconstrained, so json1 and json2 must be
-        discarded."""
+        Without the fix, tokens before the spurious </think> would bypass
+        grammar validation, producing invalid output like ```json."""
         from vllm.v1.core.sched.scheduler import Scheduler
 
         manager = StructuredOutputManager(mock_vllm_config)
@@ -493,78 +439,184 @@ class TestReasoningStructuredOutput:
         mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
         manager.reasoner = mock_reasoning_parser
 
-        # Build a minimal mock scheduler with the structured output manager
+        # Build a minimal mock scheduler
         mock_scheduler = Mock(spec=Scheduler)
         mock_scheduler.structured_output_manager = manager
-        # Bind the real method to the mock
-        mock_scheduler._truncate_unconstrained_post_reasoning_tokens = (
-            Scheduler._truncate_unconstrained_post_reasoning_tokens.__get__(
-                mock_scheduler
-            )
+        mock_scheduler._validate_spec_tokens_with_reasoning = (
+            Scheduler._validate_spec_tokens_with_reasoning.__get__(mock_scheduler)
         )
+
+        # Mock grammar that accepts JSON_TOKEN_A/B but rejects everything
+        # else (stops at first invalid token, matching validate_tokens
+        # semantics).
+        grammar = Mock()
+        grammar.is_terminated.return_value = False
+
+        def mock_validate(tokens):
+            result = []
+            for t in tokens:
+                if t in (JSON_TOKEN_A, JSON_TOKEN_B):
+                    result.append(t)
+                else:
+                    break  # First invalid token stops validation
+            return result
+
+        grammar.validate_tokens.side_effect = mock_validate
 
         request = Mock(spec=Request)
-        request.request_id = "req-test-truncate"
-        request.num_computed_tokens = 10
-        request.num_output_placeholders = 5
+        request.request_id = "req-root-cause"
+        request.structured_output_request = Mock()
+        request.structured_output_request.grammar = grammar
+        request.use_structured_output = True
 
-        # Case 1: </think> not in drafts, at position 0 in accepted
-        # → truncate to just [THINK_END_TOKEN]
-        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
-        accepted = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
-        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
-            accepted, draft, request
+        # Scenario: reasoning_ended=True, EAGLE drafter produces a
+        # spurious </think> in drafts. Before the fix, tokens before
+        # </think> (like BACKTICK=30) would bypass grammar validation.
+        BACKTICK = 30
+        request.structured_output_request.reasoning_ended = True
+        spec_tokens = [
+            BACKTICK,
+            REASONING_TOKEN_A,
+            REASONING_TOKEN_B,
+            THINK_END_TOKEN,
+            JSON_TOKEN_A,
+        ]
+
+        result = mock_scheduler._validate_spec_tokens_with_reasoning(
+            request, spec_tokens
         )
-        assert result == [THINK_END_TOKEN]
-        assert request.num_computed_tokens == 8  # 10 - 2 discarded
-        assert request.num_output_placeholders == 3  # 5 - 2 discarded
 
-        # Reset counters
-        request.num_computed_tokens = 10
-        request.num_output_placeholders = 5
-
-        # Case 2: </think> at position 2 in drafts, position 0 in accepted
-        # → truncate to just [THINK_END_TOKEN]
-        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B, THINK_END_TOKEN]
-        accepted = [THINK_END_TOKEN, JSON_TOKEN_A, JSON_TOKEN_B]
-        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
-            accepted, draft, request
+        # ALL tokens must be grammar-validated. BACKTICK is invalid,
+        # so validation stops immediately -> empty result.
+        assert result == [], (
+            f"Expected empty (all tokens rejected), got {result}. "
+            f"Spurious </think> in drafts must NOT create an "
+            f"unconstrained pre-reasoning split."
         )
-        assert result == [THINK_END_TOKEN]
-        assert request.num_computed_tokens == 8
-        assert request.num_output_placeholders == 3
 
-        # Reset counters
-        request.num_computed_tokens = 10
-        request.num_output_placeholders = 5
+        # Verify grammar.validate_tokens was called with ALL tokens
+        grammar.validate_tokens.assert_called_once_with(spec_tokens)
 
-        # Case 3: </think> at same position in both → no truncation
-        draft = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_A]
-        accepted = [REASONING_TOKEN_A, THINK_END_TOKEN, JSON_TOKEN_B]
-        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
-            accepted, draft, request
+    def test_validate_spec_tokens_searches_reasoning_when_not_ended(
+        self,
+        mock_vllm_config,
+        mock_reasoning_parser,
+    ):
+        """When reasoning_ended=False, _validate_spec_tokens_with_reasoning
+        should still search for </think> in drafts and split correctly."""
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        manager = StructuredOutputManager(mock_vllm_config)
+
+        def mock_streaming(all_ids, delta):
+            return THINK_END_TOKEN in delta
+
+        mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
+        manager.reasoner = mock_reasoning_parser
+
+        mock_scheduler = Mock(spec=Scheduler)
+        mock_scheduler.structured_output_manager = manager
+        mock_scheduler._validate_spec_tokens_with_reasoning = (
+            Scheduler._validate_spec_tokens_with_reasoning.__get__(mock_scheduler)
         )
-        assert result == accepted  # unchanged
-        assert request.num_computed_tokens == 10  # unchanged
-        assert request.num_output_placeholders == 5  # unchanged
 
-        # Case 4: no </think> in accepted → no truncation
-        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
-        accepted = [REASONING_TOKEN_A, REASONING_TOKEN_B, JSON_TOKEN_A]
-        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
-            accepted, draft, request
-        )
-        assert result == accepted  # unchanged
+        grammar = Mock()
+        grammar.is_terminated.return_value = False
+        grammar.validate_tokens.side_effect = lambda tokens: [
+            t for t in tokens if t in (JSON_TOKEN_A, JSON_TOKEN_B)
+        ]
 
-        # Case 5: </think> is the last accepted token → no actual
-        # discarding needed (nothing after it)
-        request.num_computed_tokens = 10
-        request.num_output_placeholders = 5
-        draft = [REASONING_TOKEN_A, REASONING_TOKEN_B]
-        accepted = [REASONING_TOKEN_A, THINK_END_TOKEN]
-        result = mock_scheduler._truncate_unconstrained_post_reasoning_tokens(
-            accepted, draft, request
+        request = Mock(spec=Request)
+        request.request_id = "req-not-ended"
+        request.structured_output_request = Mock()
+        request.structured_output_request.grammar = grammar
+        request.structured_output_request.reasoning_ended = False
+        request.use_structured_output = True
+
+        # Drafts: [reasoning, </think>, json_a, invalid]
+        spec_tokens = [
+            REASONING_TOKEN_A,
+            THINK_END_TOKEN,
+            JSON_TOKEN_A,
+            REASONING_TOKEN_B,
+        ]
+
+        result = mock_scheduler._validate_spec_tokens_with_reasoning(
+            request, spec_tokens
         )
-        assert result == [REASONING_TOKEN_A, THINK_END_TOKEN]
-        assert request.num_computed_tokens == 10  # no change, nothing discarded
-        assert request.num_output_placeholders == 5
+
+        # Pre = [REASONING_TOKEN_A, THINK_END_TOKEN] (unvalidated)
+        # Post = [JSON_TOKEN_A, REASONING_TOKEN_B] -> validated
+        #      -> [JSON_TOKEN_A] (REASONING_TOKEN_B filtered out)
+        assert result == [
+            REASONING_TOKEN_A,
+            THINK_END_TOKEN,
+            JSON_TOKEN_A,
+        ]
+
+    def test_grammar_bitmask_all_constrained_when_reasoning_ended(
+        self,
+        mock_vllm_config,
+        mock_reasoning_parser,
+    ):
+        """Root cause regression test for grammar_bitmask: when
+        reasoning_ended=True (apply_bitmask=True), ALL bitmask positions
+        must be grammar-constrained, even if spec tokens contain a
+        spurious </think>.
+
+        Without the fix, positions before the spurious </think> would get
+        FULL_MASK (unconstrained), allowing invalid tokens through."""
+        manager = self._make_manager_for_bitmask_test(
+            mock_vllm_config, mock_reasoning_parser, num_spec_tokens=5
+        )
+        grammar = self._make_grammar_mock()
+
+        def mock_streaming(all_ids, delta):
+            return delta == [THINK_END_TOKEN]
+
+        mock_reasoning_parser.is_reasoning_end_streaming.side_effect = mock_streaming
+        mock_reasoning_parser.is_reasoning_end.return_value = True
+
+        request = Mock(spec=Request)
+        request.structured_output_request = Mock()
+        request.structured_output_request.reasoning_ended = True
+        request.structured_output_request.grammar = grammar
+        request.use_structured_output = True
+        request.prompt_token_ids = [1, 2, 3]
+
+        req_id = "req-root-cause-bitmask"
+        # Spurious </think> at index 3 in the draft tokens
+        spec_tokens = [
+            JSON_TOKEN_A,
+            JSON_TOKEN_B,
+            REASONING_TOKEN_A,
+            THINK_END_TOKEN,
+            JSON_TOKEN_A,
+        ]
+
+        result = manager.grammar_bitmask(
+            requests={req_id: request},
+            structured_output_request_ids=[req_id],
+            scheduled_spec_decode_tokens={req_id: spec_tokens},
+        )
+
+        assert result is not None
+
+        # fill_bitmask should have been called for ALL 6 positions
+        # (5 spec + 1 bonus), and ALL with apply_bitmask=True
+        # (no FULL_MASK from reasoning split).
+        fill_calls = grammar.fill_bitmask.call_args_list
+        assert len(fill_calls) == 6, (
+            f"Expected 6 fill_bitmask calls (5 spec + 1 bonus), got {len(fill_calls)}"
+        )
+
+        # Verify accept_tokens was called for spec tokens (grammar
+        # constraining all positions). The </think> token itself should
+        # be accepted by the grammar mock (accept_tokens returns True).
+        assert grammar.accept_tokens.call_count > 0, (
+            "Grammar should have accepted tokens for constrained positions"
+        )
+
+        # All state advancements should be rolled back
+        if grammar.accept_tokens.call_count > 0:
+            grammar.rollback.assert_called_once_with(grammar.accept_tokens.call_count)

@@ -761,32 +761,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_ids = input_batch.input_ids[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
-            logger.debug(
-                "[GRDBG] model_runner.sample(): grammar_output present - "
-                "req_ids=%s, bitmask_shape=%s, num_reqs=%d, "
-                "num_draft_tokens=%d, logits_shape=%s",
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask.shape
-                if grammar_output.grammar_bitmask is not None
-                else None,
-                input_batch.num_reqs,
-                input_batch.num_draft_tokens,
-                logits.shape,
-            )
             # Apply grammar bitmask to the logits in-place.
             self.structured_outputs_worker.apply_grammar_bitmask(
                 logits,
                 input_batch,
                 grammar_output.structured_output_request_ids,
                 grammar_output.grammar_bitmask,
-            )
-        else:
-            logger.debug(
-                "[GRDBG] model_runner.sample(): grammar_output is NONE - "
-                "no grammar bitmask applied. num_reqs=%d, "
-                "num_draft_tokens=%d",
-                input_batch.num_reqs,
-                input_batch.num_draft_tokens,
             )
 
         # Sample tokens and compute logprobs (if needed).

@@ -1235,22 +1235,12 @@ class Scheduler(SchedulerInterface):
             external_load_encoder_input,
         )
 
-    _grammar_step_counter: int = 0
-
     def get_grammar_bitmask(
         self, scheduler_output: SchedulerOutput
     ) -> GrammarOutput | None:
-        Scheduler._grammar_step_counter += 1
-        step_id = Scheduler._grammar_step_counter
-
         # Collect list of scheduled request ids that use structured output.
         # The corresponding rows of the bitmask will be in this order.
         if not scheduler_output.has_structured_output_requests:
-            logger.debug(
-                "[GRDBG] get_grammar_bitmask: step=%d, "
-                "SKIP (no structured output requests in batch)",
-                step_id,
-            )
             return None
 
         structured_output_request_ids = [
@@ -1260,44 +1250,7 @@ class Scheduler(SchedulerInterface):
             and (req.use_structured_output and not req.is_prefill_chunk)
         ]
         if not structured_output_request_ids:
-            logger.debug(
-                "[GRDBG] get_grammar_bitmask: step=%d, "
-                "SKIP (all structured reqs are prefill or missing), "
-                "scheduled_reqs=%s",
-                step_id,
-                list(scheduler_output.num_scheduled_tokens.keys()),
-            )
             return None
-
-        # Log at INFO for early grammar states to diagnose the boundary bug
-        _early_grammar = any(
-            (req := self.requests.get(rid)) is not None
-            and req.structured_output_request is not None
-            and req.structured_output_request.grammar is not None
-            and getattr(
-                req.structured_output_request.grammar, "num_processed_tokens", 999
-            )
-            < 5
-            for rid in structured_output_request_ids
-        )
-        _spec_tokens_dict = {
-            k: v
-            for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
-            if k in structured_output_request_ids
-        }
-        _log_fn = logger.info if _early_grammar else logger.debug
-        _log_fn(
-            "[GRDBG] get_grammar_bitmask: step=%d, "
-            "generating bitmask for %d reqs: %s, "
-            "spec_tokens=%s",
-            step_id,
-            len(structured_output_request_ids),
-            structured_output_request_ids,
-            _spec_tokens_dict,
-        )
-        # Stamp step_id on scheduler_output for correlation
-        # with update_from_output logs.
-        scheduler_output._grdbg_step_id = step_id  # type: ignore[attr-defined]
 
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
@@ -1311,11 +1264,6 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        _grdbg_step = getattr(scheduler_output, "_grdbg_step_id", "?")
-        logger.debug(
-            "[GRDBG] update_from_output: processing output from step=%s",
-            _grdbg_step,
-        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1407,26 +1355,6 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
-            # When using speculative decoding with structured output and
-            # reasoning: if the target model resampled </think> at a
-            # position where the bitmask was not expecting it (e.g. the
-            # draft tokens didn't contain </think> or had it at a later
-            # position), tokens after </think> may have been sampled
-            # without grammar constraints.  Truncate to just after
-            # </think> so the next step re-generates those tokens with
-            # proper grammar constraints.
-            if (
-                scheduled_spec_token_ids
-                and new_token_ids
-                and request.use_structured_output
-                and not request.structured_output_request.reasoning_ended
-            ):
-                new_token_ids = self._truncate_unconstrained_post_reasoning_tokens(
-                    new_token_ids,
-                    scheduled_spec_token_ids,
-                    request,
-                )
-
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -1469,7 +1397,6 @@ class Scheduler(SchedulerInterface):
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
                 grammar = struct_output_request.grammar
-                state_before = getattr(grammar, "num_processed_tokens", "?")
                 # When reasoning ends within this token batch (e.g. during
                 # speculative decoding), only the tokens after the
                 # reasoning_end marker should be fed to the grammar.
@@ -1478,98 +1405,8 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                # Log at WARNING if tokens_for_grammar differs from
-                # new_token_ids (boundary step where reasoning ended
-                # mid-batch), otherwise debug.
-                if tokens_for_grammar != new_token_ids:
-                    logger.warning(
-                        "[GRDBG] update_from_output: req=%s, "
-                        "REASONING BOUNDARY - new_token_ids=%s, "
-                        "tokens_for_grammar=%s, "
-                        "grammar_state_before=%s, reasoning_ended=%s",
-                        req_id,
-                        new_token_ids,
-                        tokens_for_grammar,
-                        state_before,
-                        struct_output_request.reasoning_ended,
-                    )
-                else:
-                    # Log at INFO level for the first few grammar states
-                    # (right after reasoning boundary) to catch the bug.
-                    _log_fn = (
-                        logger.info
-                        if isinstance(state_before, int) and state_before < 5
-                        else logger.debug
-                    )
-                    _log_fn(
-                        "[GRDBG] update_from_output: req=%s, "
-                        "new_token_ids=%s, tokens_for_grammar=%s, "
-                        "grammar_state_before=%s, reasoning_ended=%s",
-                        req_id,
-                        new_token_ids,
-                        tokens_for_grammar,
-                        state_before,
-                        struct_output_request.reasoning_ended,
-                    )
                 if tokens_for_grammar:
-                    ok = grammar.accept_tokens(req_id, tokens_for_grammar)
-                    if not ok:
-                        state_after = getattr(grammar, "num_processed_tokens", "?")
-                        # Diagnostic: check what the grammar allows at
-                        # the current state to verify bitmask correctness.
-                        diag_info = ""
-                        try:
-                            bitmask_mgr = self.structured_output_manager
-                            if bitmask_mgr.backend is not None:
-                                diag_bitmask = (
-                                    bitmask_mgr.backend.allocate_token_bitmask(1)
-                                )
-                                grammar.fill_bitmask(diag_bitmask, 0)
-                                import numpy as np
-
-                                bm_np = diag_bitmask.numpy()[0]
-                                # Check if the rejected token is allowed
-                                rejected_token = (
-                                    tokens_for_grammar[
-                                        int(state_after) - int(state_before)
-                                    ]
-                                    if isinstance(state_after, int)
-                                    and isinstance(state_before, int)
-                                    else tokens_for_grammar[0]
-                                )
-                                word_idx = rejected_token // 32
-                                bit_idx = rejected_token % 32
-                                is_allowed = (
-                                    bool((bm_np[word_idx] >> bit_idx) & 1)
-                                    if word_idx < len(bm_np)
-                                    else False
-                                )
-                                # Count total allowed tokens
-                                total_allowed = sum(
-                                    bin(int(w) & 0xFFFFFFFF).count("1") for w in bm_np
-                                )
-                                diag_info = (
-                                    f", DIAG: token {rejected_token} "
-                                    f"allowed_in_bitmask={is_allowed}, "
-                                    f"total_allowed_tokens={total_allowed}, "
-                                    f"grammar_state_at_check={state_after}"
-                                )
-                        except Exception as diag_err:
-                            diag_info = f", DIAG_ERROR: {diag_err}"
-                        logger.error(
-                            "[GRDBG] update_from_output: req=%s "
-                            "GRAMMAR REJECTED tokens! "
-                            "grammar_state=%s->%s "
-                            "(PARTIAL ADVANCE, NO ROLLBACK), "
-                            "tokens_for_grammar=%s, "
-                            "all new_token_ids=%s%s",
-                            req_id,
-                            state_before,
-                            state_after,
-                            tokens_for_grammar,
-                            new_token_ids,
-                            diag_info,
-                        )
+                    grammar.accept_tokens(req_id, tokens_for_grammar)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -1767,75 +1604,6 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
-    def _truncate_unconstrained_post_reasoning_tokens(
-        self,
-        new_token_ids: list[int],
-        scheduled_spec_token_ids: list[int],
-        request: Request,
-    ) -> list[int]:
-        """Truncate tokens after an unexpected reasoning-end marker.
-
-        During speculative decoding, the grammar bitmask is pre-computed
-        based on the draft tokens.  If the target model's rejection
-        sampling produces </think> at a position where the draft did not
-        have it (or at an earlier position), the bitmask rows after that
-        point were all-unconstrained.  Any tokens sampled at those
-        positions were not grammar-constrained and must be discarded so
-        the next step can re-generate them properly.
-
-        Returns *new_token_ids* unchanged when no truncation is needed,
-        or a truncated copy that keeps only tokens up to and including
-        the reasoning-end marker.
-        """
-        so_mgr = self.structured_output_manager
-        if so_mgr.reasoner is None or so_mgr.enable_in_reasoning:
-            return new_token_ids
-
-        end_in_accepted = so_mgr.find_reasoning_end_in_tokens(new_token_ids)
-        if end_in_accepted is None:
-            # No reasoning-end in the accepted tokens — nothing to do.
-            return new_token_ids
-
-        end_in_drafts = so_mgr.find_reasoning_end_in_tokens(scheduled_spec_token_ids)
-
-        # If reasoning-end is at the same or later position in the
-        # accepted tokens compared to the drafts, the bitmask was
-        # correct for the positions that follow.  Only truncate when the
-        # accepted reasoning-end is earlier than expected (or absent
-        # from the drafts entirely).
-        if end_in_drafts is not None and end_in_accepted >= end_in_drafts:
-            return new_token_ids
-
-        # Truncate: keep tokens up to and including the reasoning-end
-        # marker.  The tokens after it were sampled without grammar
-        # constraints and will be re-generated in the next step.
-        truncate_at = end_in_accepted + 1
-        num_discarded = len(new_token_ids) - truncate_at
-        if num_discarded <= 0:
-            return new_token_ids
-
-        logger.debug(
-            "Truncating %d unconstrained post-reasoning tokens for "
-            "request %s (reasoning_end at accepted pos %d, draft pos %s)",
-            num_discarded,
-            request.request_id,
-            end_in_accepted,
-            end_in_drafts,
-        )
-
-        new_token_ids = new_token_ids[:truncate_at]
-
-        # Adjust bookkeeping: the discarded tokens were already
-        # counted as "computed" during the earlier rejection-sampling
-        # adjustment (they were accepted by the target model).  Undo
-        # that for the tokens we're now discarding.
-        if request.num_computed_tokens > 0:
-            request.num_computed_tokens -= num_discarded
-        if request.num_output_placeholders > 0:
-            request.num_output_placeholders -= num_discarded
-
-        return new_token_ids
-
     def _should_validate_draft_tokens(
         self, request: Request, spec_token_ids: list[int]
     ) -> bool:
@@ -1879,14 +1647,27 @@ class Scheduler(SchedulerInterface):
         """Validate speculative tokens against the grammar, handling
         reasoning-end markers.
 
-        When the reasoning_end token appears within the draft tokens,
-        only tokens after the marker are validated by the grammar.
-        Tokens up to and including the marker pass through unvalidated.
+        When reasoning has already ended (from previously accepted tokens),
+        ALL draft tokens are validated against the grammar. Any spurious
+        reasoning-end tokens in the drafts are ignored — they are just
+        regular invalid tokens from the grammar's perspective.
+
+        When reasoning has NOT ended yet and the reasoning_end token
+        appears within the draft tokens, only tokens after the marker
+        are validated by the grammar. Tokens up to and including the
+        marker pass through unvalidated.
         """
         metadata = request.structured_output_request
         assert metadata is not None and metadata.grammar is not None
 
-        grammar_state = getattr(metadata.grammar, "num_processed_tokens", "?")
+        # When reasoning already ended, validate ALL draft tokens.
+        # Do NOT search for </think> in drafts — any such token is
+        # spurious from the EAGLE drafter and must be grammar-validated
+        # (and rejected) like any other token.
+        if metadata.reasoning_ended:
+            return metadata.grammar.validate_tokens(spec_token_ids)
+
+        # Reasoning hasn't ended yet — check if it ends mid-draft.
         split_idx = self.structured_output_manager.find_reasoning_end_in_tokens(
             spec_token_ids
         )
@@ -1894,38 +1675,12 @@ class Scheduler(SchedulerInterface):
             pre = spec_token_ids[: split_idx + 1]
             post = spec_token_ids[split_idx + 1 :]
             validated_post = metadata.grammar.validate_tokens(post)
-            result = pre + validated_post
-            if len(result) != len(spec_token_ids):
-                logger.debug(
-                    "[GRDBG] _validate_spec_tokens_with_reasoning: "
-                    "req=%s, TRIMMED %d->%d, split_idx=%d, "
-                    "grammar_state=%s, pre=%s, post=%s, "
-                    "validated_post=%s",
-                    request.request_id,
-                    len(spec_token_ids),
-                    len(result),
-                    split_idx,
-                    grammar_state,
-                    pre,
-                    post,
-                    validated_post,
-                )
-            return result
+            return pre + validated_post
 
-        result = metadata.grammar.validate_tokens(spec_token_ids)
-        if len(result) != len(spec_token_ids):
-            logger.debug(
-                "[GRDBG] _validate_spec_tokens_with_reasoning: "
-                "req=%s, TRIMMED %d->%d (no reasoning split), "
-                "grammar_state=%s, spec=%s, validated=%s",
-                request.request_id,
-                len(spec_token_ids),
-                len(result),
-                grammar_state,
-                spec_token_ids,
-                result,
-            )
-        return result
+        # No reasoning-end in drafts and reasoning hasn't ended yet.
+        # All tokens are still in reasoning mode — validate them all
+        # anyway (the caller already determined validation is needed).
+        return metadata.grammar.validate_tokens(spec_token_ids)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
