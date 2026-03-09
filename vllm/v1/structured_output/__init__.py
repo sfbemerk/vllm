@@ -194,7 +194,7 @@ class StructuredOutputManager:
                 self._grammar_bitmask[index].fill_(self._full_mask)
                 num_processed = getattr(grammar, "num_processed_tokens", "?")
                 reason = "terminated" if terminated else "apply_bitmask=False"
-                logger.info(
+                logger.debug(
                     "[GRDBG] _fill_bitmasks: idx=%d, FULL_MASK (%s), num_processed=%s",
                     index,
                     reason,
@@ -281,7 +281,7 @@ class StructuredOutputManager:
                 apply_bitmask = self.should_fill_bitmask(request)
                 num_processed_start = getattr(grammar, "num_processed_tokens", "?")
 
-                logger.info(
+                logger.debug(
                     "[GRDBG] grammar_bitmask: req=%s, apply_bitmask=%s, "
                     "reasoning_ended=%s, grammar_state=%s, "
                     "terminated=%s, spec_tokens=%s",
@@ -376,7 +376,7 @@ class StructuredOutputManager:
         # Summary: count FULL_MASK vs CONSTRAINED rows
         num_masks = result_bitmask.shape[0]
         full_count = sum(1 for i in range(num_masks) if np.all(result_bitmask[i] == -1))
-        logger.info(
+        logger.debug(
             "[GRDBG] grammar_bitmask: DONE, %d rows (%d full_mask, %d constrained)",
             num_masks,
             full_count,
@@ -514,12 +514,14 @@ class StructuredOutputManager:
                 # The end marker is in new_token_ids — reasoning ended
                 # within this batch. Return tokens after the end marker.
                 result = new_token_ids[idx + 1 :]
-                logger.info(
+                logger.warning(
                     "[GRDBG] get_tokens_after_reasoning: req=%s, "
-                    "end_marker at idx=%d, returning %d tokens "
-                    "after marker: %s",
+                    "BOUNDARY STEP - end_marker at idx=%d in "
+                    "new_token_ids=%s, %d tokens AFTER marker "
+                    "were sampled WITHOUT grammar constraint: %s",
                     getattr(request, "request_id", "?"),
                     idx,
+                    new_token_ids,
                     len(result),
                     result,
                 )

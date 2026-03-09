@@ -389,12 +389,12 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        logger.info(
+        logger.debug(
             "[GRDBG] step(): SYNC path - calling get_grammar_bitmask num_scheduled=%d",
             scheduler_output.total_num_scheduled_tokens,
         )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        logger.info(
+        logger.debug(
             "[GRDBG] step(): grammar_output=%s",
             "None"
             if grammar_output is None
@@ -470,7 +470,7 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    logger.info(
+                    logger.warning(
                         "[GRDBG] step_with_batch_queue(): NON-DEFERRED path "
                         "(pending_structured_output_tokens=False) - calling "
                         "get_grammar_bitmask BEFORE update_from_output of "
@@ -480,7 +480,7 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    logger.info(
+                    logger.warning(
                         "[GRDBG] step_with_batch_queue(): NON-DEFERRED "
                         "grammar_output=%s",
                         "None"
@@ -494,7 +494,7 @@ class EngineCore:
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
-                    logger.info(
+                    logger.debug(
                         "[GRDBG] step_with_batch_queue(): DEFERRED path "
                         "(pending_structured_output_tokens=True) - will "
                         "wait for update_from_output before grammar. "
@@ -545,7 +545,7 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            logger.info(
+            logger.debug(
                 "[GRDBG] step_with_batch_queue(): Processing DEFERRED "
                 "scheduler_output after update_from_output completed"
             )
@@ -555,7 +555,7 @@ class EngineCore:
             if self.use_spec_decode:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
                 assert draft_token_ids is not None
-                logger.info(
+                logger.debug(
                     "[GRDBG] step_with_batch_queue(): DEFERRED spec decode - "
                     "got %d draft_token_id req entries, calling "
                     "update_draft_token_ids_in_output",
@@ -569,14 +569,14 @@ class EngineCore:
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            logger.info(
+            logger.debug(
                 "[GRDBG] step_with_batch_queue(): DEFERRED - calling "
                 "get_grammar_bitmask"
             )
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            logger.info(
+            logger.debug(
                 "[GRDBG] step_with_batch_queue(): DEFERRED grammar_output=%s",
                 "None"
                 if grammar_output is None

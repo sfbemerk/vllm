@@ -152,7 +152,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         Returns False if the FSM failed to advance.
         """
         if self._is_terminated:
-            logger.info(
+            logger.warning(
                 "[GRDBG] accept_tokens: req=%s SKIP (terminated), "
                 "num_processed=%d, tokens=%s",
                 request_id,
@@ -179,7 +179,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 return False
             self.num_processed_tokens += 1
         self._is_terminated = self.matcher.is_terminated()
-        logger.info(
+        logger.debug(
             "[GRDBG] accept_tokens: req=%s OK, num_processed=%d->%d, "
             "terminated=%s, tokens=%s",
             request_id,
@@ -207,7 +207,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
             # Rollback the FSM to the initial state
             self.matcher.rollback(len(accepted_tokens))
         if len(accepted_tokens) != len(tokens):
-            logger.info(
+            logger.debug(
                 "[GRDBG] validate_tokens: TRIMMED %d->%d, "
                 "num_processed=%d (unchanged), "
                 "rejected_at=%d token=%s, tokens=%s",
@@ -228,7 +228,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.matcher.rollback(num_tokens)
         self.num_processed_tokens -= num_tokens
         self._is_terminated = self.matcher.is_terminated()
-        logger.info(
+        logger.debug(
             "[GRDBG] rollback: n=%d, num_processed=%d->%d, terminated=%s->%s",
             num_tokens,
             state_before,

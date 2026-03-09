@@ -1246,7 +1246,7 @@ class Scheduler(SchedulerInterface):
         # Collect list of scheduled request ids that use structured output.
         # The corresponding rows of the bitmask will be in this order.
         if not scheduler_output.has_structured_output_requests:
-            logger.info(
+            logger.debug(
                 "[GRDBG] get_grammar_bitmask: step=%d, "
                 "SKIP (no structured output requests in batch)",
                 step_id,
@@ -1260,7 +1260,7 @@ class Scheduler(SchedulerInterface):
             and (req.use_structured_output and not req.is_prefill_chunk)
         ]
         if not structured_output_request_ids:
-            logger.info(
+            logger.debug(
                 "[GRDBG] get_grammar_bitmask: step=%d, "
                 "SKIP (all structured reqs are prefill or missing), "
                 "scheduled_reqs=%s",
@@ -1269,7 +1269,7 @@ class Scheduler(SchedulerInterface):
             )
             return None
 
-        logger.info(
+        logger.debug(
             "[GRDBG] get_grammar_bitmask: step=%d, "
             "generating bitmask for %d reqs: %s, "
             "spec_tokens=%s",
@@ -1299,7 +1299,7 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         _grdbg_step = getattr(scheduler_output, "_grdbg_step_id", "?")
-        logger.info(
+        logger.debug(
             "[GRDBG] update_from_output: processing output from step=%s",
             _grdbg_step,
         )
@@ -1465,16 +1465,32 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                logger.info(
-                    "[GRDBG] update_from_output: req=%s, "
-                    "new_token_ids=%s, tokens_for_grammar=%s, "
-                    "grammar_state_before=%s, reasoning_ended=%s",
-                    req_id,
-                    new_token_ids,
-                    tokens_for_grammar,
-                    state_before,
-                    struct_output_request.reasoning_ended,
-                )
+                # Log at WARNING if tokens_for_grammar differs from
+                # new_token_ids (boundary step where reasoning ended
+                # mid-batch), otherwise debug.
+                if tokens_for_grammar != new_token_ids:
+                    logger.warning(
+                        "[GRDBG] update_from_output: req=%s, "
+                        "REASONING BOUNDARY - new_token_ids=%s, "
+                        "tokens_for_grammar=%s, "
+                        "grammar_state_before=%s, reasoning_ended=%s",
+                        req_id,
+                        new_token_ids,
+                        tokens_for_grammar,
+                        state_before,
+                        struct_output_request.reasoning_ended,
+                    )
+                else:
+                    logger.debug(
+                        "[GRDBG] update_from_output: req=%s, "
+                        "new_token_ids=%s, tokens_for_grammar=%s, "
+                        "grammar_state_before=%s, reasoning_ended=%s",
+                        req_id,
+                        new_token_ids,
+                        tokens_for_grammar,
+                        state_before,
+                        struct_output_request.reasoning_ended,
+                    )
                 if tokens_for_grammar:
                     ok = grammar.accept_tokens(req_id, tokens_for_grammar)
                     if not ok:
@@ -1818,7 +1834,7 @@ class Scheduler(SchedulerInterface):
             validated_post = metadata.grammar.validate_tokens(post)
             result = pre + validated_post
             if len(result) != len(spec_token_ids):
-                logger.info(
+                logger.debug(
                     "[GRDBG] _validate_spec_tokens_with_reasoning: "
                     "req=%s, TRIMMED %d->%d, split_idx=%d, "
                     "grammar_state=%s, pre=%s, post=%s, "
@@ -1836,7 +1852,7 @@ class Scheduler(SchedulerInterface):
 
         result = metadata.grammar.validate_tokens(spec_token_ids)
         if len(result) != len(spec_token_ids):
-            logger.info(
+            logger.debug(
                 "[GRDBG] _validate_spec_tokens_with_reasoning: "
                 "req=%s, TRIMMED %d->%d (no reasoning split), "
                 "grammar_state=%s, spec=%s, validated=%s",
