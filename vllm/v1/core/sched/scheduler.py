@@ -1269,18 +1269,31 @@ class Scheduler(SchedulerInterface):
             )
             return None
 
-        logger.debug(
+        # Log at INFO for early grammar states to diagnose the boundary bug
+        _early_grammar = any(
+            (req := self.requests.get(rid)) is not None
+            and req.structured_output_request is not None
+            and req.structured_output_request.grammar is not None
+            and getattr(
+                req.structured_output_request.grammar, "num_processed_tokens", 999
+            )
+            < 5
+            for rid in structured_output_request_ids
+        )
+        _spec_tokens_dict = {
+            k: v
+            for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
+            if k in structured_output_request_ids
+        }
+        _log_fn = logger.info if _early_grammar else logger.debug
+        _log_fn(
             "[GRDBG] get_grammar_bitmask: step=%d, "
             "generating bitmask for %d reqs: %s, "
             "spec_tokens=%s",
             step_id,
             len(structured_output_request_ids),
             structured_output_request_ids,
-            {
-                k: v
-                for k, v in scheduler_output.scheduled_spec_decode_tokens.items()
-                if k in structured_output_request_ids
-            },
+            _spec_tokens_dict,
         )
         # Stamp step_id on scheduler_output for correlation
         # with update_from_output logs.
@@ -1481,7 +1494,14 @@ class Scheduler(SchedulerInterface):
                         struct_output_request.reasoning_ended,
                     )
                 else:
-                    logger.debug(
+                    # Log at INFO level for the first few grammar states
+                    # (right after reasoning boundary) to catch the bug.
+                    _log_fn = (
+                        logger.info
+                        if isinstance(state_before, int) and state_before < 5
+                        else logger.debug
+                    )
+                    _log_fn(
                         "[GRDBG] update_from_output: req=%s, "
                         "new_token_ids=%s, tokens_for_grammar=%s, "
                         "grammar_state_before=%s, reasoning_ended=%s",
@@ -1495,18 +1515,60 @@ class Scheduler(SchedulerInterface):
                     ok = grammar.accept_tokens(req_id, tokens_for_grammar)
                     if not ok:
                         state_after = getattr(grammar, "num_processed_tokens", "?")
+                        # Diagnostic: check what the grammar allows at
+                        # the current state to verify bitmask correctness.
+                        diag_info = ""
+                        try:
+                            bitmask_mgr = self.structured_output_manager
+                            if bitmask_mgr.backend is not None:
+                                diag_bitmask = (
+                                    bitmask_mgr.backend.allocate_token_bitmask(1)
+                                )
+                                grammar.fill_bitmask(diag_bitmask, 0)
+                                import numpy as np
+
+                                bm_np = diag_bitmask.numpy()[0]
+                                # Check if the rejected token is allowed
+                                rejected_token = (
+                                    tokens_for_grammar[
+                                        int(state_after) - int(state_before)
+                                    ]
+                                    if isinstance(state_after, int)
+                                    and isinstance(state_before, int)
+                                    else tokens_for_grammar[0]
+                                )
+                                word_idx = rejected_token // 32
+                                bit_idx = rejected_token % 32
+                                is_allowed = (
+                                    bool((bm_np[word_idx] >> bit_idx) & 1)
+                                    if word_idx < len(bm_np)
+                                    else False
+                                )
+                                # Count total allowed tokens
+                                total_allowed = sum(
+                                    bin(int(w) & 0xFFFFFFFF).count("1") for w in bm_np
+                                )
+                                diag_info = (
+                                    f", DIAG: token {rejected_token} "
+                                    f"allowed_in_bitmask={is_allowed}, "
+                                    f"total_allowed_tokens={total_allowed}, "
+                                    f"grammar_state_at_check={state_after}"
+                                )
+                        except Exception as diag_err:
+                            diag_info = f", DIAG_ERROR: {diag_err}"
                         logger.error(
                             "[GRDBG] update_from_output: req=%s "
                             "GRAMMAR REJECTED tokens! "
                             "grammar_state=%s->%s "
                             "(PARTIAL ADVANCE, NO ROLLBACK), "
                             "tokens_for_grammar=%s, "
-                            "all new_token_ids=%s",
+                            "all new_token_ids=%s%s",
                             req_id,
                             state_before,
                             state_after,
                             tokens_for_grammar,
                             new_token_ids,
+                            diag_info,
                         )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
